@@ -1,0 +1,138 @@
+name: 构建和发布
+
+on:
+  push:
+    tags:
+      - 'v*'  # 当推送标签时触发
+  workflow_dispatch:  # 手动触发
+    inputs:
+      version:
+        description: '版本号 (例如: v2.0.0)'
+        required: true
+        default: 'v2.0.0'
+
+jobs:
+  build:
+    name: 构建应用
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            python-version: "3.11"
+            artifact-name: "HTTP-Requests-Tool-Windows"
+            executable-extension: ".exe"
+          - os: ubuntu-latest
+            python-version: "3.11"
+            artifact-name: "HTTP-Requests-Tool-Linux"
+            executable-extension: ""
+          - os: macos-latest
+            python-version: "3.11"
+            artifact-name: "HTTP-Requests-Tool-macOS"
+            executable-extension: ".app"
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 设置Python环境
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'pip'
+
+    - name: 安装系统依赖 (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libegl1-mesa libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0
+
+    - name: 安装Python依赖
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements-dev.txt
+
+    - name: 运行构建脚本
+      run: python build.py
+
+    - name: 上传构建产物
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.artifact-name }}
+        path: release/${{ matrix.artifact-name }}*
+        retention-days: 30
+
+  release:
+    name: 创建发布
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 下载所有构建产物
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts
+
+    - name: 准备发布文件
+      run: |
+        mkdir -p release-files
+        find artifacts -name "*.zip" -o -name "*.tar.gz" | xargs -I {} cp {} release-files/
+        ls -la release-files/
+
+    - name: 获取版本号
+      id: get_version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: 生成发布说明
+      id: release_notes
+      run: |
+        cat > release_notes.md << 'EOF'
+        ## HTTP请求工具 ${{ steps.get_version.outputs.version }}
+
+        ### 🎉 新功能
+        - 全新的现代化界面设计
+        - 异步请求处理，避免界面冻结
+        - 完整的请求历史记录管理
+        - 配置保存和加载功能
+        - 智能JSON格式化
+        - 详细的响应信息显示
+
+        ### 📦 下载说明
+        - **Windows用户**: 下载 `HTTP-Requests-Tool-Windows.zip`
+        - **Linux用户**: 下载 `HTTP-Requests-Tool-Linux.tar.gz`
+        - **macOS用户**: 下载 `HTTP-Requests-Tool-macOS.tar.gz`
+
+        ### 🚀 使用方法
+        1. 下载对应平台的压缩包
+        2. 解压到任意目录
+        3. 运行可执行文件即可使用
+
+        ### 📋 系统要求
+        - Windows 10/11 (64位)
+        - Ubuntu 20.04+ / CentOS 8+ (64位)
+        - macOS 10.15+ (64位)
+
+        ### 🐛 问题反馈
+        如遇到问题，请在 [Issues](https://github.com/${{ github.repository }}/issues) 页面反馈。
+        EOF
+
+    - name: 创建GitHub发布
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.get_version.outputs.version }}
+        name: HTTP请求工具 ${{ steps.get_version.outputs.version }}
+        body_path: release_notes.md
+        files: release-files/*
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
