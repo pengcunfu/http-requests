@@ -151,6 +151,7 @@ class RequestThread(QThread):
     """异步请求线程"""
     finished = QSignal(dict)
     error = QSignal(str)
+    cancelled = QSignal()
 
     def __init__(self, method, url, headers, data, timeout=30):
         super().__init__()
@@ -159,35 +160,66 @@ class RequestThread(QThread):
         self.headers = headers
         self.data = data
         self.timeout = timeout
+        self._should_stop = False
+        self._session = None
+
+    def stop_request(self):
+        """停止请求"""
+        self._should_stop = True
+        if self._session:
+            try:
+                # 关闭session以中断请求
+                self._session.close()
+            except:
+                pass
 
     def run(self):
         try:
+            # 检查是否需要停止
+            if self._should_stop:
+                self.cancelled.emit()
+                return
+
             start_time = time.time()
+
+            # 创建session以便中断请求
+            self._session = requests.Session()
+
+            # 设置较短的超时时间以便及时响应中断
+            connect_timeout = min(5, self.timeout)
+            read_timeout = self.timeout
 
             if self.method in ["POST", "PUT", "PATCH"]:
                 if isinstance(self.data, dict):
-                    response = requests.request(
+                    response = self._session.request(
                         method=self.method,
                         url=self.url,
                         headers=self.headers,
                         json=self.data,
-                        timeout=self.timeout
+                        timeout=(connect_timeout, read_timeout)
                     )
                 else:
-                    response = requests.request(
+                    response = self._session.request(
                         method=self.method,
                         url=self.url,
                         headers=self.headers,
                         data=self.data,
-                        timeout=self.timeout
+                        timeout=(connect_timeout, read_timeout)
                     )
             else:
-                response = requests.request(
+                response = self._session.request(
                     method=self.method,
                     url=self.url,
                     headers=self.headers,
-                    timeout=self.timeout
+                    timeout=(connect_timeout, read_timeout)
                 )
+
+            # 检查是否在请求过程中被停止
+            if self._should_stop:
+                if hasattr(response, 'close'):
+                    response.close()
+                self.cancelled.emit()
+                return
 
             end_time = time.time()
             response_time = round((end_time - start_time) * 1000, 2)  # 毫秒
@@ -208,10 +240,33 @@ class RequestThread(QThread):
             except:
                 result['json'] = None
 
-            self.finished.emit(result)
+            # 关闭response
+            if hasattr(response, 'close'):
+                response.close()
 
+            self._session.close()
+            self._session = None
+
+            if not self._should_stop:
+                self.finished.emit(result)
+
+        except requests.exceptions.Timeout:
+            if self._should_stop:
+                self.cancelled.emit()
+            else:
+                self.error.emit("请求超时")
+        except requests.exceptions.ConnectionError:
+            if self._should_stop:
+                self.cancelled.emit()
+            else:
+                self.error.emit("连接错误")
         except Exception as e:
-            self.error.emit(str(e))
+            if self._should_stop:
+                self.cancelled.emit()
+            else:
+                self.error.emit(str(e))
+        finally:
+            self._session = None
 
 
 class HTTPClient(QMainWindow):
@@ -364,6 +419,12 @@ class HTTPClient(QMainWindow):
         self.timeout_spin.setValue(30)
         self.timeout_spin.setMinimumWidth(80)
 
+        # 停止按钮
+        self.stop_button = QPushButton("停止请求")
+        self.stop_button.clicked.connect(self.stop_request)
+        self.stop_button.setMinimumHeight(40)
+        self.stop_button.setEnabled(False)  # 初始时禁用
+
         # 发送按钮
         self.send_button = QPushButton("发送请求")
         self.send_button.clicked.connect(self.send_request)
@@ -377,6 +438,7 @@ class HTTPClient(QMainWindow):
         second_row.addWidget(self.timeout_spin)
         second_row.addStretch()
         second_row.addWidget(save_button)
+        second_row.addWidget(self.stop_button)
         second_row.addWidget(self.send_button)
 
         request_layout.addLayout(second_row)
@@ -884,12 +946,12 @@ class HTTPClient(QMainWindow):
 
         # 停止之前的请求
         if self.current_request_thread and self.current_request_thread.isRunning():
-            self.current_request_thread.terminate()
-            self.current_request_thread.wait()
+            self.stop_request()
 
         # 更新UI状态
         self.send_button.setEnabled(False)
         self.send_button.setText("发送中...")
+        self.stop_button.setEnabled(True)  # 启用停止按钮
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # 无限进度条
         self.status_bar.showMessage("正在发送请求...")
@@ -907,6 +969,7 @@ class HTTPClient(QMainWindow):
         self.current_request_thread = RequestThread(method, url, headers, data, timeout)
         self.current_request_thread.finished.connect(self.on_request_finished)
         self.current_request_thread.error.connect(self.on_request_error)
+        self.current_request_thread.cancelled.connect(self.on_request_cancelled)
         self.current_request_thread.start()
 
         # 添加到历史记录
@@ -917,6 +980,7 @@ class HTTPClient(QMainWindow):
         # 恢复UI状态
         self.send_button.setEnabled(True)
         self.send_button.setText("发送请求")
+        self.stop_button.setEnabled(False)  # 禁用停止按钮
         self.progress_bar.setVisible(False)
 
         # 显示响应信息
@@ -963,6 +1027,7 @@ class HTTPClient(QMainWindow):
         # 恢复UI状态
         self.send_button.setEnabled(True)
         self.send_button.setText("发送请求")
+        self.stop_button.setEnabled(False)  # 禁用停止按钮
         self.progress_bar.setVisible(False)
 
         # 显示错误信息
@@ -1038,6 +1103,48 @@ class HTTPClient(QMainWindow):
 
                 # 切换到请求头标签页查看导入的数据
                 self.tab_widget.setCurrentIndex(0)
+
+    def stop_request(self):
+        """停止当前请求"""
+        if self.current_request_thread and self.current_request_thread.isRunning():
+            # 优雅地停止请求
+            self.current_request_thread.stop_request()
+
+            # 更新UI状态
+            self.send_button.setEnabled(True)
+            self.send_button.setText("发送请求")
+            self.stop_button.setEnabled(False)
+            self.progress_bar.setVisible(False)
+
+            # 显示停止信息
+            self.status_label.setText("状态: <span style='color: #fd7e14; font-weight: bold;'>已停止</span>")
+            self.time_label.setText("响应时间: -")
+            self.size_label.setText("大小: -")
+
+            self.response_edit.clear()
+            self.response_edit.append("=== 请求已停止 ===")
+            self.response_edit.append("请求已被用户手动停止")
+
+            self.status_bar.showMessage("请求已停止", 3000)
+
+    def on_request_cancelled(self):
+        """请求被取消处理"""
+        # 恢复UI状态
+        self.send_button.setEnabled(True)
+        self.send_button.setText("发送请求")
+        self.stop_button.setEnabled(False)
+        self.progress_bar.setVisible(False)
+
+        # 显示取消信息
+        self.status_label.setText("状态: <span style='color: #fd7e14; font-weight: bold;'>已取消</span>")
+        self.time_label.setText("响应时间: -")
+        self.size_label.setText("大小: -")
+
+        self.response_edit.clear()
+        self.response_edit.append("=== 请求已取消 ===")
+        self.response_edit.append("请求在执行过程中被取消")
+
+        self.status_bar.showMessage("请求已取消", 3000)
 
 
 # 为了向后兼容，保留原始类名
