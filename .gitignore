@@ -1,2 +1,4 @@
 dist/
 release/
+__pycache__/
+.claude/
